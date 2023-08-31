@@ -1,5 +1,5 @@
 {
-  "name": "exinone/mixin-sdk-php",
+  "name": "chikiday/mixin-sdk-php",
   "description": "Mixin-Network SDK for PHP, modify from ExinOne/laravel-mixin-sdk",
   "type": "library",
   "license": "MIT",

@@ -25,7 +25,7 @@
     "php": "^7.2 || ^8.0",
     "firebase/php-jwt": "*",
     "guzzlehttp/guzzle": "^6.3 || ^7.0",
-    "ramsey/uuid": "^3.8 || ^4",
+    "ramsey/uuid": "^3.8",
     "phpseclib/phpseclib": "^2.0",
     "wrench/wrench": "^2.0",
     "web-token/jwt-easy": "^2.2",

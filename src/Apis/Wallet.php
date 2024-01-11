@@ -8,49 +8,48 @@
 
 namespace ExinOne\MixinSDK\Apis;
 
+use Base64Url\Base64Url;
+use Brick\Math\BigDecimal;
+use ExinOne\MixinSDK\Exceptions\EncodeFailException;
+use ExinOne\MixinSDK\Exceptions\EncodeNotYetImplementedException;
+use ExinOne\MixinSDK\Exceptions\InternalErrorException;
+use ExinOne\MixinSDK\Exceptions\InvalidInputFieldException;
+use ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException;
+use ExinOne\MixinSDK\Exceptions\NotSupportTIPPINException;
+use ExinOne\MixinSDK\Traits\MixinSDKTrait;
+use ExinOne\MixinSDK\Utils\Blake3;
+use ExinOne\MixinSDK\Utils\TIPService;
+use ExinOne\MixinSDK\Utils\TransactionV5\Encoder;
 use Ramsey\Uuid\Uuid;
 
 class Wallet extends Api
 {
     /**
-     * @param string $asset_id
-     * @param string $destination BTC address or EOS account name like ‘eoswithmixin’
-     * @param        $pin
-     * @param        $label       “Mixin”, can’t be blank, max size 64
-     * @param        $tag         can be blank, EOS account tag or memo
+     * @param string      $asset_id
+     * @param string      $destination BTC address or EOS account name like ‘eoswithmixin’
+     * @param string|null $pin
+     * @param string      $label       can’t be blank, max size 64
+     * @param string      $tag         can be blank, EOS account tag or memo
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException
      */
-    public function createAddress(string $asset_id, string $destination, $pin, $label, $tag = false): array
+    public function createAddress(string $asset_id, string $destination, ?string $pin, string $label, string $tag = ''): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
 
-        if (is_bool($tag)) {
-            if (! $tag) {
-                $body = [
-                    'asset_id'   => $asset_id,
-                    'public_key' => $destination,
-                    'label'      => $label,
-                    'pin'        => $pin == '' ? '' : $this->encryptPin((string)$pin),
-                ];
-            } else {
-                $body = [
-                    'asset_id'     => $asset_id,
-                    'account_name' => $destination,
-                    'account_tag'  => $label,
-                    'pin'          => $pin == '' ? '' : $this->encryptPin((string)$pin),
-                ];
-            }
+        $body = [
+            'asset_id'    => $asset_id,
+            'label'       => $label,
+            'destination' => $destination,
+            'tag'         => $tag,
+        ];
+
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, "TIP:ADDRESS:ADD:", $asset_id, $destination, $tag, $label);
         } else {
-            $body = [
-                'asset_id'    => $asset_id,
-                'label'       => $label,
-                'pin'         => $pin == '' ? '' : $this->encryptPin((string)$pin),
-                'destination' => $destination,
-                'tag'         => $tag,
-            ];
+            $body['pin'] = $this->encryptPin($pin);
         }
 
         return $this->res($body);
@@ -65,7 +64,7 @@ class Wallet extends Api
      * @param null   $pin
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException|NotSupportTIPPINException
      * @deprecated 由于支持新的 alpha 创建地址api，该方法遗弃
      */
     public function createAddressRaw(string $asset_id, $public_key, $label, $account_name, $account_tag, $pin = null)
@@ -73,6 +72,8 @@ class Wallet extends Api
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
+
+        assertTIPPIN($pin, 'createAddressRaw does not support TIP pin');
 
         $body = [
             'asset_id'     => $asset_id,
@@ -116,23 +117,25 @@ class Wallet extends Api
 
     /**
      * @param string $addressId
-     * @param        $pin
+     * @param string $pin
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
      */
-    public function deleteAddress(string $addressId, $pin = null): array
+    public function deleteAddress(string $address_id, string $pin = null): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
 
-        $body = [
-            'pin' => $pin == '' ? '' : $this->encryptPin((string)$pin),
-        ];
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, "TIP:ADDRESS:REMOVE:", $address_id);
+        } else {
+            $body['pin'] = $this->encryptPin($pin);
+        }
 
-        $url = str_replace('{$addressId}', $addressId, $this->endPointUrl);
+        $url = str_replace('{$addressId}', $address_id, $this->endPointUrl);
 
         return $this->res($body, $url);
     }
@@ -176,59 +179,83 @@ class Wallet extends Api
     }
 
     /**
-     * @param string $addressId
-     * @param        $amount
-     * @param string $memo
-     * @param        $pin
-     * @param null   $trace_id
-     *
+     * @param string      $address_id
+     * @param string      $amount
+     * @param string|null $pin
+     * @param string      $memo
+     * @param string|null $trace_id
+     * @param string      $fee 通过查询手续费的接口得到的手续费具体数值，不传的话会由主网自动决定
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws \Exception
      */
-    public function withdrawal(string $addressId, $amount, $pin, $memo = '', $trace_id = null): array
+    public function withdrawal(string $address_id, string $amount, ?string $pin, string $memo = '', string $trace_id = null, string $fee = '0'): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
 
+        $trace_id = empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id;
+
+        $amount = (string)BigDecimal::of($amount)->stripTrailingZeros();
+        $fee    = (string)BigDecimal::of($fee)->stripTrailingZeros();
+
         $body = [
-            'address_id' => $addressId,
-            'amount'     => (string)$amount,
+            'address_id' => $address_id,
+            'amount'     => $amount,
             'memo'       => $memo,
-            'trace_id'   => empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id,
-            'pin'        => $this->encryptPin($pin),
+            'trace_id'   => $trace_id,
         ];
+
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, 'TIP:WITHDRAWAL:CREATE:', $address_id, $amount, $fee, $trace_id, $memo);
+        } else {
+            $body['pin'] = $this->encryptPin($pin);
+        }
+
+        if (is_numeric($fee) && $fee > 0) {
+            $body['fee'] = $fee;
+        }
 
         return $this->res($body);
     }
 
     /**
-     * @param string $assetId
-     * @param string $opponentId
-     * @param        $pin
-     * @param        $amount
-     * @param string $memo
-     * @param null   $trace_id
+     * @param string      $asset_id
+     * @param string      $opponent_id
+     * @param string|null $pin
+     * @param string      $amount
+     * @param string      $memo
+     * @param string|null $trace_id
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException
      */
-    public function transfer(string $assetId, string $opponentId, $pin, $amount, $memo = '', $trace_id = null): array
+    public function transfer(string $asset_id, string $opponent_id, ?string $pin, string $amount, string $memo = '', string $trace_id = null): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
 
+        $trace_id = empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id;
+
+        $amount = (string)BigDecimal::of($amount)->stripTrailingZeros();
+
         $body = [
-            'asset_id'    => $assetId,
-            'opponent_id' => $opponentId,
-            'amount'      => (string)$amount,
-            'pin'         => $this->encryptPin($pin),
-            'trace_id'    => empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id,
+            'asset_id'    => $asset_id,
+            'opponent_id' => $opponent_id,
+            'amount'      => $amount,
+            'trace_id'    => $trace_id,
             'memo'        => $memo,
         ];
 
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, 'TIP:TRANSFER:CREATE:', $asset_id, $opponent_id, $amount, $trace_id, $memo);
+        } else {
+            $body['pin'] = $this->encryptPin($pin);
+        }
+
         $headers = [
+            //todo 似乎已经不需要了
             'Mixin-Device-Id' => $this->config['session_id'],
         ];
 
@@ -293,10 +320,10 @@ class Wallet extends Api
      */
     public function readUserSnapshots($limit = null, string $offset = null, string $asset = '', string $order = 'DESC'): array
     {
-        $limit   = empty($limit) ? $limit : (int)$limit;
-        $urlArgv = compact('limit', 'offset', 'asset', 'order');
+        $limit    = empty($limit) ? $limit : (int)$limit;
+        $url_argv = compact('limit', 'offset', 'asset', 'order');
 
-        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($urlArgv));
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
 
         return $this->res([], $url);
     }
@@ -329,14 +356,14 @@ class Wallet extends Api
      */
     public function accessTokenGetUserSnapshots(string $access_token, $limit = null, string $offset = null, string $asset = '', string $order = 'DESC'): array
     {
-        $limit   = empty($limit) ? $limit : (int)$limit;
-        $urlArgv = compact('limit', 'offset', 'asset', 'order');
+        $limit    = empty($limit) ? $limit : (int)$limit;
+        $url_argv = compact('limit', 'offset', 'asset', 'order');
 
         $headers = [
             'Authorization' => 'Bearer '.$access_token,
         ];
 
-        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($urlArgv));
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
 
         return $this->res([], $url, $headers);
     }
@@ -459,26 +486,25 @@ class Wallet extends Api
     }
 
     /**
-     * @deprecated
      * @param string|null $offset
      * @param int|null    $limit
      *
      * @return array
      * @throws \Exception
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
+     * @deprecated
      */
     public function readMultisigs(string $offset = '', $limit = null): array
     {
-        $limit   = empty($limit) ? 100 : (int)$limit;
-        $urlArgv = compact('limit', 'offset');
+        $limit    = empty($limit) ? 100 : (int)$limit;
+        $url_argv = compact('limit', 'offset');
 
-        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($urlArgv));
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
 
         return $this->res([], $url);
     }
 
     /**
-     * @deprecated
      * @param string $access_token
      * @param string $raw
      * @param string $action
@@ -486,6 +512,7 @@ class Wallet extends Api
      * @return array
      * @throws \Exception
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
+     * @deprecated
      */
     public function accessTokenPostMultisigs(string $access_token, string $raw, string $action = 'sign'): array
     {
@@ -507,7 +534,7 @@ class Wallet extends Api
      * @throws \Exception
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
      */
-    public function accessTokenPostOutputs($access_token, $receivers, $index = 0,$hint = ""): array
+    public function accessTokenPostOutputs($access_token, $receivers, $index = 0, $hint = ""): array
     {
         $headers = [
             'Authorization' => 'Bearer '.$access_token,
@@ -522,17 +549,17 @@ class Wallet extends Api
     }
 
     /**
-     * @param  array  $receivers
-     * @param  int  $index
-     * @param  string  $hint
+     * @param array  $receivers
+     * @param int    $index
+     * @param string $hint
      * @return array
      */
-    public function readOutputs($receivers, $index = 0,$hint = ""): array
+    public function readOutputs($receivers, $index = 0, $hint = ""): array
     {
         if ($hint === "") {
             $hint = Uuid::uuid4()->toString();
         }
-        $body = compact('receivers', 'index','hint');
+        $body = compact('receivers', 'index', 'hint');
 
         return $this->res($body);
     }
@@ -553,13 +580,13 @@ class Wallet extends Api
     }
 
     /**
-     * @deprecated
      * @param string $raw
      * @param string $action
      *
      * @return array
      * @throws \Exception
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
+     * @deprecated
      */
     public function postMultisigs(string $raw, string $action = 'sign'): array
     {
@@ -604,11 +631,11 @@ class Wallet extends Api
     }
 
     /**
-     * @param string $request_id
+     * @param string      $request_id
      * @param string|null $pin
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException|\Exception
      */
     public function multisigsRequestsSign(string $request_id, string $pin = null): array
     {
@@ -618,41 +645,39 @@ class Wallet extends Api
 
         $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
 
-        $body = [
-            'pin' => $this->encryptPin((string)$pin),
-        ];
-
-        return $this->res($body, $url);
-    }
-
-    /**
-     * @param string $request_id
-     * @param string|null $pin
-     *
-     * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
-     */
-    public function multisigsRequestsCancel(string $request_id, string $pin = null): array
-    {
-        if ($pin === null) {
-            $pin = $this->config['pin'];
+        if (TIPService::isTIPPin($pin)) {
+            $body = [
+                'pin_base64' => $this->encryptTIPPin($pin, "TIP:MULTISIG:REQUEST:SIGN:", $request_id),
+            ];
+        } else {
+            $body = [
+                'pin' => $this->encryptPin($pin),
+            ];
         }
 
-        $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
-
-        $body = [
-            'pin' => $this->encryptPin((string)$pin),
-        ];
-
         return $this->res($body, $url);
     }
 
     /**
-     * @param string $request_id
+     * @param string      $request_id
      * @param string|null $pin
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException
+     */
+    public function multisigsRequestsCancel(string $request_id): array
+    {
+        $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
+
+        return $this->res([], $url);
+    }
+
+    /**
+     * @param string      $request_id
+     * @param string|null $pin
+     *
+     * @return array
+     * @throws LoadPrivateKeyException
      */
     public function multisigsRequestsUnlock(string $request_id, string $pin = null): array
     {
@@ -662,27 +687,35 @@ class Wallet extends Api
 
         $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
 
-        $body = [
-            'pin' => $this->encryptPin((string)$pin),
-        ];
+        if (TIPService::isTIPPin($pin)) {
+            $body = [
+                'pin_base64' => $this->encryptTIPPin($pin, 'TIP:MULTISIG:REQUEST:UNLOCK:', $request_id),
+            ];
+        } else {
+            $body = [
+                'pin' => $this->encryptPin($pin),
+            ];
+        }
 
         return $this->res($body, $url);
     }
 
     /**
-     * @deprecated
-     * @param string $request_id
-     * @param string $pin
+     * @param string      $request_id
+     * @param string|null $pin
      *
      * @return array
-     * @throws \Exception
-     * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
+     * @throws LoadPrivateKeyException
+     * @throws NotSupportTIPPINException
+     * @deprecated use multisigsRequestsSign instead
      */
     public function multisigsSign(string $request_id, string $pin = null): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
+
+        assertTIPPIN($pin, 'multisigsSign does not support TIP pin');
 
         $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
 
@@ -711,12 +744,15 @@ class Wallet extends Api
      * @return array
      * @throws \Exception
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
+     * @deprecated use multisigsRequestsCancel instead
      */
     public function multisigsCancel(string $request_id, string $pin = null): array
     {
         if ($pin === null) {
             $pin = $this->config['pin'];
         }
+
+        assertTIPPIN($pin, 'multisigsCancel does not support TIP pin');
 
         $url = str_replace('{$requestId}', $request_id, $this->endPointUrl);
 
@@ -750,14 +786,23 @@ class Wallet extends Api
             'threshold' => $threshold,
         ];
 
+        $trace_id = empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id;
+
+        $amount = (string)BigDecimal::of($amount)->stripTrailingZeros();
+
         $body = [
             'asset_id'          => $asset_id,
             'opponent_multisig' => $opponent_multisig,
             'amount'            => $amount,
-            'pin'               => $this->encryptPin($pin),
-            'trace_id'          => empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id,
+            'trace_id'          => $trace_id,
             'memo'              => $memo,
         ];
+
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, "TIP:TRANSACTION:CREATE:", $asset_id, implode('', $receivers), $threshold, $amount, $trace_id, $memo);
+        } else {
+            $body['pin'] = $this->encryptPin($pin);
+        }
 
         return $this->res($body);
     }
@@ -779,14 +824,23 @@ class Wallet extends Api
             $pin = $this->config['pin'];
         }
 
+        $trace_id = empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id;
+
+        $amount = (string)BigDecimal::of($amount)->stripTrailingZeros();
+
         $body = [
             'asset_id'     => $asset_id,
             'opponent_key' => $opponent_key,
             'amount'       => $amount,
-            'pin'          => $this->encryptPin($pin),
-            'trace_id'     => empty($trace_id) ? Uuid::uuid4()->toString() : $trace_id,
+            'trace_id'     => $trace_id,
             'memo'         => $memo,
         ];
+
+        if (TIPService::isTIPPin($pin)) {
+            $body['pin_base64'] = $this->encryptTIPPin($pin, "TIP:TRANSACTION:CREATE:", $asset_id, $opponent_key, $amount, $trace_id, $memo);
+        } else {
+            $body['pin'] = $this->encryptPin($pin);
+        }
 
         return $this->res($body);
     }
@@ -804,17 +858,17 @@ class Wallet extends Api
      */
     public function readMultisigsOutputs(string $offset = '', array $members = [], $state = '', $threshold = 2, $limit = '500')
     {
-        if (!empty($members)) {
+        if (! empty($members)) {
             sort($members);
             $members = hash('sha3-256', implode('', $members));
         } else {
             $members = null;
         }
 
-        $limit   = empty($limit) ? 100 : (int) $limit;
-        $urlArgv = compact('limit', 'offset', 'state', 'members', 'threshold');
+        $limit    = empty($limit) ? 100 : (int)$limit;
+        $url_argv = compact('limit', 'offset', 'state', 'members', 'threshold');
 
-        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($urlArgv));
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
         return $this->res([], $url);
     }
 
@@ -836,7 +890,7 @@ class Wallet extends Api
             'Authorization' => 'Bearer '.$access_token,
         ];
 
-        if (!empty($members)) {
+        if (! empty($members)) {
             sort($members);
             $members = hash('sha3-256', implode('', $members));
         } else {
@@ -854,7 +908,7 @@ class Wallet extends Api
      * @param string $action
      *
      * @return array
-     * @throws \ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException
+     * @throws LoadPrivateKeyException
      */
     public function accessTokenMultisigsRequestsAction(string $access_token, string $request_id, $action = 'sign'): array
     {
@@ -862,8 +916,241 @@ class Wallet extends Api
             'Authorization' => 'Bearer '.$access_token,
         ];
 
-        $url = str_replace(['{$requestId}','{$action}'], [$request_id, $action], $this->endPointUrl);
+        $url = str_replace(['{$requestId}', '{$action}'], [$request_id, $action], $this->endPointUrl);
 
-        return $this->res($body, $url, $headers);
+        return $this->res([], $url, $headers);
+    }
+
+    public function safeFetchDepositEntries(string $chain_uuid, array $members, int $threshold): array
+    {
+        $body = [
+            'members'   => $members,
+            'threshold' => $threshold,
+            'chain_id'  => $chain_uuid,
+        ];
+        return $this->res($body);
+    }
+
+    public function safeReadDeposits(string $asset_uuid = null, string $destination = null, string $tag = null, string $offset = null, int $limit = 500): array
+    {
+        $asset    = $asset_uuid;
+        $url_argv = compact('asset', 'destination', 'tag', 'offset', 'limit');
+
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
+
+        return $this->res([], $url);
+    }
+
+    public function safeReadOutputs(array $members_array = null, int $threshold = null, int $offset_sequence = null, int $limit = 500, string $asset_hash = null, string $state = null, string $order = 'ASC'): array
+    {
+        $members = null;
+        if (is_array($members_array)) {
+            sort($members_array);
+            $members = hash('sha3-256', implode('', $members_array));
+        }
+
+        $offset = $offset_sequence;
+
+        $asset = $asset_hash;
+
+        $url_argv = compact('members', 'threshold', 'offset', 'limit', 'asset', 'state', 'order');
+
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
+
+        return $this->res([], $url);
+    }
+
+    public function accessTokenSafeReadOutputs(string $access_token, array $members_array = null, int $threshold = null, int $offset_sequence = null, int $limit = 500, string $asset_hash = null, string $state = null, string $order = 'ASC'): array
+    {
+        $members = null;
+        if (is_array($members_array)) {
+            sort($members_array);
+            $members = hash('sha3-256', implode('', $members_array));
+        }
+
+        $offset = $offset_sequence;
+
+        $asset = $asset_hash;
+
+        $url_argv = compact('members', 'threshold', 'offset', 'limit', 'asset', 'state', 'order');
+
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
+
+        return $this->res([], $url, [
+            'Authorization' => 'Bearer '.$access_token,
+        ]);
+    }
+
+    /**
+     * @param array{
+     *     receivers: string[],
+     *     index: int,
+     *     hint: string
+     * } $receiver_info
+     * @return array
+     * @throws \Exception
+     */
+    public function safeFetchKeys(array $receiver_info): array
+    {
+        // 简单的参数校验
+        foreach ($receiver_info as $index => $info) {
+            if (! isset($info['receivers'])) {
+                throw new InvalidInputFieldException("field `receivers`(array) is required in element {$index}");
+            }
+            if (! isset($info['index'])) {
+                throw new InvalidInputFieldException("field `index`(int) is required in element {$index}");
+            }
+            if (! isset($info['hint'])) {
+                throw new InvalidInputFieldException("field `hint`(string) is required in element {$index}");
+            }
+        }
+        return $this->res($receiver_info);
+    }
+
+    public function safeRequestTransaction(array $transaction, string $request_id): array
+    {
+        $body = [
+            [
+                'request_id' => $request_id,
+                'raw'        => (new Encoder())->encodeTransaction($transaction),
+            ],
+        ];
+
+        return $this->res($body);
+    }
+
+    //todo safeRequestTransactions
+
+    //todo safeSendTransactions
+
+    /**
+     * @param array       $transaction
+     * @param array       $views
+     * @param string|null $trace_id
+     * @param string|null $spent_key
+     * @param bool        $use_32_bits
+     * @return array
+     * @throws EncodeFailException
+     * @throws EncodeNotYetImplementedException
+     * @throws InvalidInputFieldException
+     * @throws InternalErrorException
+     * @throws \SodiumException
+     */
+    public function safeSendTransaction(array $transaction, array $views, string $trace_id = null, string $spent_key = null, bool $use_32_bits = false): array
+    {
+        $inputs = $transaction['inputs'] ?? [];
+        if (! $inputs) {
+            throw new InvalidInputFieldException('MISSING_INPUTS');
+        }
+        if (count($inputs) !== count($views)) {
+            throw new InvalidInputFieldException('INPUTS_AND_VIEWS_NOT_MATCH');
+        }
+
+        $raw = (new Encoder())->encodeTransaction($transaction);
+        $msg = (new Blake3())->hash(hex2bin($raw));
+
+        if (! $spent_key) {
+            $spent_key = $this->config['safe_key'] ?? null;
+        }
+        if ($spent_key === null) {
+            throw new InvalidInputFieldException('NEED_SPENT_KEY_TO_PERFORM_TRANSACTION');
+        }
+
+        $raw_key = substr(Base64Url::decode($spent_key), 0, 32);
+
+        $spent_y = hash("sha512", $raw_key, true);
+
+        $y = TIPService::getBytesWithClamping(substr($spent_y, 0, 32));
+
+        $signatures_map = [];
+        foreach ($inputs as $i => $input) {
+            if (! ($views[$i] ?? null)) {
+                throw new InvalidInputFieldException('MISSING_VIEW');
+            }
+
+            $seed = hex2bin($views[$i]);
+
+            // $seed = sodium_crypto_core_ristretto255_scalar_add($seed, $y);
+            $seed = \ParagonIE_Sodium_Core_Ed25519::scalar_add($seed, $y);
+
+            $pub = TIPService::getPublicKeyFromEd25519KeyPair($seed, $use_32_bits);
+
+            $new_key = $seed.$pub;
+
+            $sig = bin2hex(TIPService::signWithMixinEd25519($new_key, hex2bin($msg)));
+
+            $signatures_map[$i] = [0 => $sig]; // for 1/1 bot transaction
+        }
+
+        $transaction['signatures_map'] = $signatures_map;
+
+        if (! $trace_id) {
+            $trace_id = Uuid::uuid4()->toString();
+        }
+        $body = [
+            [
+                'request_id' => $trace_id,
+                'raw'        => (new Encoder())->encodeTransaction($transaction),
+            ]
+        ];
+
+        return $this->res($body);
+    }
+
+    public function safeReadTransaction(string $request_id): array
+    {
+        $url = $this->endPointUrl.$request_id;
+
+        return $this->res([], $url);
+    }
+
+    public function accessTokenSafeReadTransaction(string $access_token, string $request_id): array
+    {
+        $url = $this->endPointUrl.$request_id;
+
+        return $this->res([], $url, [
+            'Authorization' => 'Bearer '.$access_token,
+        ]);
+    }
+
+    public function safeReadSnapshots(string $asset_uuid = null, string $app = null, string $opponent = null, string $offset = null, int $limit = 500): array
+    {
+        $asset    = $asset_uuid;
+        $url_argv = compact('asset', 'app', 'opponent', 'offset', 'limit');
+
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
+
+        return $this->res([], $url);
+    }
+
+    public function safeReadAssets(): array
+    {
+        $url = $this->endPointUrl;
+        return $this->res([], $url);
+    }
+
+    public function safeReadAsset(string $asset_id): array
+    {
+        $url = $this->endPointUrl . $asset_id;
+        return $this->res([], $url);
+    }
+
+    public function safeReadAssetWithdrawFees(string $asset_id): array
+    {
+        $url = str_replace('{$asset_id}', $asset_id, $this->endPointUrl);
+
+        return $this->res([], $url);
+    }
+
+    public function accessTokenSafeReadSnapshots(string $access_token, string $asset_uuid = null, string $app = null, string $opponent = null, string $offset = null, int $limit = 500): array
+    {
+        $asset    = $asset_uuid;
+        $url_argv = compact('asset', 'app', 'opponent', 'offset', 'limit');
+
+        $url = $this->endPointUrl.'?'.http_build_query(delEmptyItemInArray($url_argv));
+
+        return $this->res([], $url, [
+            'Authorization' => 'Bearer '.$access_token,
+        ]);
     }
 }

@@ -9,8 +9,11 @@
 namespace ExinOne\MixinSDK\Traits;
 
 use Base64Url\Base64Url;
+use Brick\Math\BigDecimal;
+use Brick\Math\RoundingMode;
 use ExinOne\MixinSDK\Exceptions\InvalidInputFieldException;
 use ExinOne\MixinSDK\Exceptions\LoadPrivateKeyException;
+use ExinOne\MixinSDK\Utils\TIPService;
 use ExinOne\MixinSDK\Utils\Transaction\Helper;
 use ExinOne\MixinSDK\Utils\Transaction\Input;
 use ExinOne\MixinSDK\Utils\Transaction\Output;
@@ -126,18 +129,25 @@ trait MixinSDKTrait
     }
 
     /**
-     * @param $pin
+     * @param string $pin 六位数字，或者是经过pack("J", 1)处理的TIP PIN的公钥，或者是TIP PIN签名的内容
      *
      * @return string
      * @throws LoadPrivateKeyException
      */
-    public function encryptPin($pin)
+    public function encryptPin(string $pin)
     {
+        if (! $pin) {
+            throw new LoadPrivateKeyException('missing pin');
+        }
         $private_key = $this->config['private_key'];
         $pin_token   = $this->config['pin_token'];
         $session_id  = $this->config['session_id'];
         $iterator    = empty($this->iterator)
-            ? microtime(true) * 100000
+            // todo use hrtime() to be more stable
+            ? (string)BigDecimal::of(microtime(true).mt_rand(100000000, 999999999))
+                ->toScale(9, RoundingMode::DOWN)
+                ->multipliedBy('1000000000')
+                ->stripTrailingZeros()
             : array_shift($this->iterator);
 
         $algorithm = $this->getKeyAlgorithm($private_key);
@@ -149,7 +159,7 @@ trait MixinSDKTrait
         } else {
             //载入私钥
             $rsa = new RSA();
-            if (!$rsa->loadKey($private_key)) {
+            if (! $rsa->loadKey($private_key)) {
                 throw  new LoadPrivateKeyException('local private key error');
             }
 
@@ -163,6 +173,25 @@ trait MixinSDKTrait
         $pin_bytes = $pin.pack("P", time()).pack("P", $iterator);
 
         return $this->encrypt_openssl($pin_bytes, $key_bytes);
+    }
+
+    public function encryptTIPPin(string $pin, string $action, ...$params)
+    {
+        if (strlen($pin) > 6) {
+            $context = hash_init('sha256');
+            hash_update($context, $action);
+            foreach ($params as $p) {
+                if (! empty($p)) {
+                    hash_update($context, (string)$p);
+                }
+            }
+            // true表示返回原始二进制数据
+            $hash = hash_final($context, true);
+            $sig  = TIPService::signWithEd25519($pin, $hash);
+        } else {
+            $sig = $pin;
+        }
+        return $this->encryptPin($sig);
     }
 
     /**+
@@ -242,12 +271,12 @@ trait MixinSDKTrait
 
         // 检查 $inputs 和 $outputs 的类型
         foreach ($inputs as $input) {
-            if (!$input instanceof Input) {
+            if (! $input instanceof Input) {
                 throw new InvalidInputFieldException("\$inputs must use 'TransactionInput' object");
             }
         }
         foreach ($outputs as $output) {
-            if (!$output instanceof Output) {
+            if (! $output instanceof Output) {
                 throw new InvalidInputFieldException("\$outputs must use 'TransactionOutput' object");
             }
         }

@@ -6,6 +6,10 @@
  * Time: 下午6:17
  */
 
+use ExinOne\MixinSDK\Exceptions\NotSupportTIPPINException;
+use ExinOne\MixinSDK\Traits\MixinSDKTrait;
+use ExinOne\MixinSDK\Utils\TIPService;
+
 if (! function_exists('camel2Underline')) {
     /**
      * @param $string
@@ -17,12 +21,7 @@ if (! function_exists('camel2Underline')) {
         return strtolower(preg_replace('/([a-z])([A-Z])/', '$1'.'_'.'$2', $string));
     }
 }
-/**
- *
- *
- *
- *
- */
+
 if (! function_exists('delEmptyItemInArray')) {
     /**
      * @param array $array
@@ -38,5 +37,19 @@ if (! function_exists('delEmptyItemInArray')) {
         });
 
         return $array;
+    }
+}
+
+if (! function_exists('assertTIPPIN')) {
+    /**
+     * @param string $pin
+     * @param string $err_msg
+     * @throws NotSupportTIPPINException
+     */
+    function assertTIPPIN(string $pin, string $err_msg)
+    {
+        if (TIPService::isTIPPin($pin)) {
+            throw new NotSupportTIPPINException($err_msg);
+        }
     }
 }

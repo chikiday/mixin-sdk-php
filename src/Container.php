@@ -26,6 +26,7 @@ use GuzzleHttp\Client;
  * @method  array addFavoriteApp(string $user_id): array
  * @method  array removeFavoriteApp(string $user_id): array
  * @method  array readFavoriteApps(string $user_id = null): array
+ * @method  array safeRegister(string $safe_private_key, string $pin = null): array
  *
  * @see \ExinOne\MixinSDK\Apis\Network
  * @method  array readUser(string $userId): array
@@ -34,7 +35,7 @@ use GuzzleHttp\Client;
  * @method  array readNetworkAsset(string $assetId): array
  * @method  array readNetworkSnapshots(int $limit = null, string $offset = null, string $asset = '', string $order = 'DESC'): array
  * @method  array readNetworkSnapshot(string $snapshotId): array
- * @method  array createUser(string $fullName, string $key_algorithm = 'RS512'): array
+ * @method  array createUser($fullName, string $key_algorithm = 'RS512'): array
  * @method  array externalTransactions(string $asset = null, string $destination = null, $limit = null, string $offset = null, string $tag = null, string $transaction_hash = null, string $source = null, string $user = null): array
  * @method  array createAttachments(): array
  * @method  array createConversations(string $category, array $participants, string $conversation_id = null, string $name = ''): array
@@ -57,11 +58,11 @@ use GuzzleHttp\Client;
  * @method  array readSnapshotsByTrace(string $traceId): array
  *
  * @see \ExinOne\MixinSDK\Apis\Wallet
- * @method  array createAddress(string $asset_id, string $destination, $pin, $label, $tag = false): array
+ * @method  array createAddress(string $asset_id, string $destination, ?string $pin, string $label, string $tag = ''): array
  * @method  array createAddressRaw(string $asset_id, $public_key, $label, $account_name, $account_tag, $pin = null): array
  * @method  array readAddresses(string $assetId): array
  * @method  array readAddress(string $addressId): array
- * @method  array deleteAddress(string $addressId, $pin = null): array
+ * @method  array deleteAddress(string $address_id, string $pin = null): array
  * @method  array readAssets(): array
  * @method  array readAsset(string $assetId): array
  * @method  array deposit(string $assetId): array
@@ -86,12 +87,23 @@ use GuzzleHttp\Client;
  * @method  array accessTokenMultisigsRequests(string $access_token, string $raw, string $action = 'sign'): array
  * @method  array multisigsRequestsSign(string $request_id, string $pin = null): array
  * @method  array multisigsRequestsUnlock(string $request_id, string $pin = null): array
- * @method  array multisigsRequestsCancel(string $request_id, string $pin = null): array
+ * @method  array multisigsRequestsCancel(string $request_id): array
  * @method  array accessTokenMultisigsRequestsAction(string $access_token, string $request_id, $action = 'sign'): array
  * @method  array readFiats(): array
  * @method  array multisigsCancel(string $request_id, string $pin = null): array
  * @method  array sendMultisigTransactions(string $asset_id, array $receivers, int $threshold, string $amount, string $pin = null, string $trace_id = null, string $memo = null): array
  * @method  array sendMainnetTransactions(string $asset_id, string $opponent_key, string $amount, string $pin = null, string $trace_id = null, string $memo = null): array
+ * @method  array safeFetchDepositEntries(string $chain_uuid, array $members, int $threshold): array
+ * @method  array safeReadDeposits(string $asset_uuid = null, string $destination = null, string $tag = null, string $offset = null, int $limit = 500): array
+ * @method  array safeReadOutputs(array $members_array = null, int $threshold = null, int $offset_sequence = null, int $limit = 500, string $asset_hash = null, string $state = null, string $order = 'ASC'): array
+ * @method  array safeFetchKeys(array $receiver_info): array
+ * @method  array safeRequestTransaction(array $transaction, string $request_id): array
+ * @method  array safeSendTransaction(array $transaction, array $views, string $trace_id = null, string $spent_key = null, bool $use_32_bits = false): array
+ * @method  array safeReadTransaction(string $request_id): array
+ * @method  array safeReadSnapshots(string $asset_uuid = null, string $app = null, string $opponent = null, string $offset = null, int $limit = 500): array
+ * @method  array accessTokenSafeReadOutputs(string $access_token, array $members_array = null, int $threshold = null, int $offset_sequence = null, int $limit = 500, string $asset_hash = null, string $state = null, string $order = 'ASC'): array
+ * @method  array accessTokenSafeReadTransaction(string $access_token, string $request_id): array
+ * @method  array accessTokenSafeReadSnapshots(string $access_token, string $asset_uuid = null, string $app = null, string $opponent = null, string $offset = null, int $limit = 500): array
  *
  * @see \ExinOne\MixinSDK\Apis\Message
  * @method  array sendText($user_id, $data, $category = 'CONTACT', $conversation_id = null): array
@@ -114,6 +126,8 @@ class Container
 
     protected $raw = false;
 
+    protected $is_with_headers = false;
+
     protected $is_return_access_token = false;
 
     protected $http_async = false;
@@ -130,23 +144,28 @@ class Container
         $this->detailClass->init($name);
 
         // 调用对象的$name 方法,获得需要发送的 header 和 body
-        ['content' => $content, 'customize_res' => $customize_res, 'auth_token' => $auth_token, 'promise' => $promise]
+        ['content' => $content, 'customize_res' => $customize_res, 'auth_token' => $auth_token, 'promise' => $promise, 'headers' => $headers]
             = call_user_func_array([$this->detailClass, $name], $arguments);
 
         if ($this->isReturnAccessToken()) {
             return $auth_token;
         } elseif ($this->isHttpAsync()) {
             return $promise;
-        } elseif (!$this->isRaw() && ($content['error'] ?? 0)) {
+        } elseif (! $this->isRaw() && ($content['error'] ?? 0)) {
             // 出现异常
-            $error = $content['error'];
-            $code = isset($error['code']) ? $error['code'] : 404;
+            $error       = $content['error'];
+            $code        = isset($error['code']) ? $error['code'] : 404;
             $description = isset($error['description']) ? $error['description'] : '';
-            $this->boomRoom($code, $description);
+            $extra       = isset($error['extra']) ? $error['extra'] : '';
+            $this->boomRoom($code, $description, $extra, $headers);
         } elseif ($this->isRaw()) {
-            return array_merge($content ?? [], $customize_res);
+            $_h = [];
+            if ($this->is_with_headers) {
+                $_h = ['headers' => $headers];
+            }
+            return array_merge($content ?? [], $customize_res, $_h);
         } else {
-            return array_merge($content['data'] ?? [], $customize_res);
+            return array_merge($content['data'] ?? [], $customize_res ?? null);
         }
     }
 
@@ -191,6 +210,18 @@ class Container
     }
 
     /**
+     * only works when is raw
+     *
+     * @return $this
+     */
+    public function setWithHeaders(bool $is_with_headers = true)
+    {
+        $this->is_with_headers = $is_with_headers;
+
+        return $this;
+    }
+
+    /**
      * @param bool $is_return_access_token
      *
      * @return $this
@@ -205,7 +236,7 @@ class Container
     }
 
     /**
-     * @param Client|false $http_client
+     * @param Client|false  $http_client
      * @param \Closure|null $on_resolve
      * @param \Closure|null $on_reject
      * @return $this
@@ -214,11 +245,11 @@ class Container
     {
         if ($http_client) {
             $this->http_async = true;
-            if (!$on_resolve) {
+            if (! $on_resolve) {
                 $on_resolve = function () {
                 };
             }
-            if (!$on_reject) {
+            if (! $on_reject) {
                 $on_reject = function () {
                 };
             }
@@ -313,8 +344,10 @@ class Container
      *
      * @throws \ExinOne\MixinSDK\Exceptions\MixinNetworkRequestException
      */
-    public function boomRoom($errorCode, $description)
+    public function boomRoom($errorCode, $description, $extra, $headers = [])
     {
-        throw new MixinNetworkRequestException($description, $errorCode);
+        $extra = json_encode($extra);
+        $id = $headers['X-Request-Id'][0] ?? '';
+        throw new MixinNetworkRequestException("{$description}, {$extra}, {$id}", $errorCode);
     }
 }
